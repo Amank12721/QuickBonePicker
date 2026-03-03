@@ -22,6 +22,8 @@ from gpu_extras.batch import batch_for_shader
 from bpy.props import StringProperty, CollectionProperty, IntProperty, FloatProperty, BoolProperty
 from bpy.types import Operator, Panel, PropertyGroup, SpaceView3D
 import os
+from PIL import Image, ImageDraw, ImageFont
+import time
 
 # Global dictionary to store loaded textures
 _loaded_textures = {}
@@ -324,6 +326,120 @@ class BONEPICKER_OT_RemoveButton(Operator):
     
     def execute(self, context):
         context.scene.bone_picker_buttons.remove(self.index)
+        return {'FINISHED'}
+
+class BONEPICKER_OT_CaptureViewport(Operator):
+    """Capture viewport area under this button"""
+    bl_idname = "bonepicker.capture_viewport"
+    bl_label = "Capture Viewport to Button"
+    
+    button_index: IntProperty()
+    
+    def execute(self, context):
+        import tempfile
+        import os
+        
+        button = context.scene.bone_picker_buttons[self.button_index]
+        
+        if not button.is_empty and not button.is_pose:
+            self.report({'WARNING'}, "Only empty buttons and pose buttons can capture viewport")
+            return {'CANCELLED'}
+        
+        # Get button position and size in canvas coordinates
+        btn_x = int(button.pos_x)
+        btn_y = int(button.pos_y)
+        btn_w = int(button.width)
+        btn_h = int(button.height)
+        
+        # Get viewport dimensions
+        for area in context.screen.areas:
+            if area.type == 'VIEW_3D':
+                for region in area.regions:
+                    if region.type == 'WINDOW':
+                        viewport_width = region.width
+                        viewport_height = region.height
+                        break
+                break
+        
+        # Create temp file for full viewport capture
+        temp_dir = tempfile.gettempdir()
+        temp_full = os.path.join(temp_dir, "bonepicker_full_capture.png")
+        temp_cropped = os.path.join(temp_dir, f"bonepicker_cropped_{self.button_index}.png")
+        
+        # Save current render settings
+        original_path = context.scene.render.filepath
+        original_format = context.scene.render.image_settings.file_format
+        original_res_x = context.scene.render.resolution_x
+        original_res_y = context.scene.render.resolution_y
+        
+        # Set viewport resolution
+        context.scene.render.resolution_x = viewport_width
+        context.scene.render.resolution_y = viewport_height
+        context.scene.render.filepath = temp_full
+        context.scene.render.image_settings.file_format = 'PNG'
+        
+        try:
+            # Capture full viewport
+            bpy.ops.render.opengl(write_still=True, view_context=True)
+            
+            # Restore settings
+            context.scene.render.filepath = original_path
+            context.scene.render.image_settings.file_format = original_format
+            context.scene.render.resolution_x = original_res_x
+            context.scene.render.resolution_y = original_res_y
+            
+            if os.path.exists(temp_full):
+                # Crop using PIL (Pillow)
+                try:
+                    from PIL import Image
+                    
+                    # Open full image
+                    img = Image.open(temp_full)
+                    
+                    # Convert button coords (bottom-left origin) to image coords (top-left origin)
+                    # Flip Y coordinate
+                    crop_left = btn_x
+                    crop_top = viewport_height - (btn_y + btn_h)
+                    crop_right = btn_x + btn_w
+                    crop_bottom = viewport_height - btn_y
+                    
+                    # Crop image
+                    cropped = img.crop((crop_left, crop_top, crop_right, crop_bottom))
+                    cropped.save(temp_cropped)
+                    
+                    # Load cropped image into Blender
+                    img_name = f"ButtonCapture_{self.button_index}"
+                    if img_name in bpy.data.images:
+                        bpy.data.images.remove(bpy.data.images[img_name])
+                    
+                    image = bpy.data.images.load(temp_cropped)
+                    image.name = img_name
+                    
+                    # Set image to button
+                    button.image_name = image.name
+                    button.image_path = temp_cropped
+                    
+                    self.report({'INFO'}, f"Viewport captured to button!")
+                    
+                except ImportError:
+                    self.report({'ERROR'}, "PIL/Pillow not available. Install it for crop feature.")
+                    return {'CANCELLED'}
+                except Exception as e:
+                    self.report({'ERROR'}, f"Crop failed: {str(e)}")
+                    return {'CANCELLED'}
+            else:
+                self.report({'ERROR'}, "Failed to capture viewport")
+                return {'CANCELLED'}
+                
+        except Exception as e:
+            # Restore settings on error
+            context.scene.render.filepath = original_path
+            context.scene.render.image_settings.file_format = original_format
+            context.scene.render.resolution_x = original_res_x
+            context.scene.render.resolution_y = original_res_y
+            self.report({'ERROR'}, f"Capture failed: {str(e)}")
+            return {'CANCELLED'}
+        
         return {'FINISHED'}
 
 class BONEPICKER_OT_RenameButton(Operator):
@@ -926,6 +1042,7 @@ def draw_callback_px(self, context):
                             indices=indices
                         )
                         
+                        
                         # Bind texture and draw
                         gpu.state.blend_set('ALPHA')
                         texture_shader.bind()
@@ -980,7 +1097,7 @@ def draw_callback_px(self, context):
                 
                 batch = batch_for_shader(shader, 'TRIS', {"pos": vertices}, indices=indices)
                 shader.bind()
-                shader.uniform_float("color", (item.color_r, item.color_g, item.color_b, 0.3 if is_temp_visible else 0.6))  # Transparent if temp visible
+                shader.uniform_float("color", (item.color_r, item.color_g, item.color_b, (0.3 if is_temp_visible else 0.6)))  # Transparent if temp visible
                 batch.draw(shader)
         
         # Button border - dashed for temp visible
@@ -1115,6 +1232,7 @@ def draw_callback_px(self, context):
                             {"pos": vertices, "texCoord": uvs},
                             indices=indices
                         )
+                        
                         
                         # Bind texture and draw
                         gpu.state.blend_set('ALPHA')
@@ -1951,6 +2069,11 @@ class BONEPICKER_PT_MainPanel(Panel):
                             op = row.operator("bonepicker.set_button_image", text="", icon='IMAGE_DATA')
                             op.index = i
                         
+                        # Capture viewport button (for empty buttons and pose buttons)
+                        if item.is_empty or item.is_pose:
+                            op = row.operator("bonepicker.capture_viewport", text="", icon='CAMERA_DATA')
+                            op.button_index = i
+                        
                         # Resize button
                         op = row.operator("bonepicker.resize_button", text="", icon='FULLSCREEN_ENTER')
                         op.index = i
@@ -1968,6 +2091,7 @@ classes = (
     BONEPICKER_OT_AddEmptyButton,
     BONEPICKER_OT_SavePose,
     BONEPICKER_OT_ApplyPose,
+    BONEPICKER_OT_CaptureViewport,
     BONEPICKER_OT_RemoveButton,
     BONEPICKER_OT_RenameButton,
     BONEPICKER_OT_ResizeButton,
